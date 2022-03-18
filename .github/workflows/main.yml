@@ -1,0 +1,83 @@
+name: Sonarqube Scan
+
+# Update the Commnad in  Run units test Step  as per Language/Project
+
+on: 
+  pull_request:
+    types: [ opened, synchronize]
+
+env:
+  PR_KEY: ${{ github.event.number }}
+  SONAR_TOKEN: ${{ secrets.TR_LABS_PROD_SONAR_TOKEN }}
+  ARTIFACTORY_USERNAME: ${{ secrets.TR_LABS_ARTIFACTORY_USERNAME }}
+  ARTIFACTORY_TOKEN: ${{ secrets.TR_LABS_ARTIFACTORY_TOKEN }}
+
+jobs:
+  sonarqube-scan:
+    runs-on: ubuntu-latest
+    name: Sonarqube Scan
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up JDK 1.8
+        uses: actions/setup-java@v1
+        with:
+          java-version: 1.8
+      - name: Install jq tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install jq
+      - name: Install Sonarqube
+        run: |
+          echo Download the Sonrqube Scanner
+          wget https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-4.6.1.2450-linux.zip
+          echo Unzip the Sonarqube Scanner
+          unzip sonar-scanner-cli-4.6.1.2450-linux.zip -d sonar-scanner
+      - name: Run Unit Tests
+        # Update the command to run unit test as per project
+        run: |
+          export PROJECT_ID="$(echo $GITHUB_REPOSITORY | cut -c 4-)"
+          echo "PROJECT_KEY=tr_$PROJECT_ID" >> $GITHUB_ENV
+          echo "PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
+          echo 'Installing poetry.... '
+          curl -sSL https://raw.githubusercontent.com/python-poetry/poetry/master/get-poetry.py | python -
+          source ~/.poetry/env
+          poetry config http-basic.tr ${{ secrets.TR_LABS_ARTIFACTORY_USERNAME }} ${{ secrets.TR_LABS_ARTIFACTORY_TOKEN }}
+          poetry install
+          poetry build
+          source .venv/bin/activate
+          echo "Running unit tests...."
+          pytest --cov-report xml:coverage.xml
+          pytest --junit-xml=tests-results/pytest_unit.xml
+      - name: Publish Unit Test Results
+        uses: EnricoMi/publish-unit-test-result-action@v1
+        if: always()
+        with:
+          files: tests-results/pytest_unit.xml          
+      - name: Run Sonarqube Scan
+        run: |
+          export SONAR_SOURCE_PATH="$PWD"
+          echo $SONAR_SOURCE_PATH
+          SONAR_PROJECT_EXISTS=`curl -s -u "$SONAR_TOKEN:" https://sonar.prod.thomsonreuters.com/api/project_analyses/search?project=${{ env.PROJECT_KEY }}  |  jq '.errors[0].msg'`
+          if [[ $SONAR_PROJECT_EXISTS == *"not found"* ]]; then
+            echo "Project not found in Sonarubqe. Run first time scan."
+            sonar-scanner/sonar-scanner-4.6.1.2450-linux/bin/sonar-scanner -Dsonar.host.url=https://sonar.prod.thomsonreuters.com/ -Dsonar.login=$SONAR_TOKEN -Dsonar.projectKey=${{ env.PROJECT_KEY }} -Dsonar.tfvc.collectionuri=https://workaround-tfvc-plugin-issue/DefaultCollection -Dsonar.sources=$SONAR_SOURCE_PATH -Dsonar.scm.provider=tfvc -X 
+            curl -s -u "$SONAR_TOKEN:" https://sonar.prod.thomsonreuters.com/api/permissions/add_group -d "groupName=LabsDevOps-Admins&permission=admin&projectKey=${{ env.PROJECT_KEY }}"
+            curl -s -u "$SONAR_TOKEN:" https://sonar.prod.thomsonreuters.com/api/alm_settings/set_github_binding -d "almSetting=labs-devops&project=${{ env.PROJECT_KEY }}&repository=tr/${{ env.PROJECT_ID }}&summaryCommentEnabled=true&monorepo=false"
+          else
+            echo "Project already exists in Sonarqube. Run the scan now."
+            sonar-scanner/sonar-scanner-4.6.1.2450-linux/bin/sonar-scanner \
+            -Dsonar.qualitygate.wait=true \
+            -Dsonar.scm.provider=git \
+            -Dsonar.host.url=https://sonar.prod.thomsonreuters.com/ \
+            -Dsonar.login=$SONAR_TOKEN \
+            -Dsonar.pullrequest.provider=github \
+            -Dsonar.pullrequest.github.repository=tr/${{ env.PROJECT_ID }} \
+            -Dsonar.projectKey=${{ env.PROJECT_KEY }} \
+            -Dsonar.pullrequest.key=$PR_KEY \
+            -Dsonar.pullrequest.branch=$GITHUB_HEAD_REF \
+            -Dsonar.pullrequest.base=$GITHUB_BASE_REF \
+            -Dsonar.tfvc.collectionuri=https://workaround-tfvc-plugin-issue/DefaultCollection \
+            -Dsonar.python.coverage.reportPaths=coverage.xml \
+            -Dsonar.coverage.exclusions=**/tests/**/*.* \
+            -Dsonar.python.xunit.reportPath=tests-results/pytest_unit.xml
+          fi
